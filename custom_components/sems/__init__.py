@@ -11,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -33,6 +34,17 @@ _IMMEDIATE_CHARGING_FUNCTION_KEYS = {
     "end_charge_soc",
     "bat_immediate_charge_power",
 }
+
+# Unique ID suffixes only used by HomeKit/powerflow sensors (not inverter sensors).
+_HOMEKIT_UNIQUE_ID_SUFFIXES = (
+    "-import-energy-total",
+    "-export-energy-total",
+    "-import-energy",
+    "-export-energy",
+    "-load-status",
+    "-homekit",
+    "-grid",
+)
 
 _ENERGY_STATISTICS_CHART_KEYS = {
     "sum",
@@ -155,6 +167,25 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
             name=DOMAIN,
             update_interval=update_interval,
         )
+
+    def _existing_homekit_sn(self) -> str | None:
+        """Return the HomeKit serial used by this entry's registered sensors."""
+        if self.config_entry is None:
+            return None
+        ent_reg = er.async_get(self.hass)
+        for entity in er.async_entries_for_config_entry(
+            ent_reg, self.config_entry.entry_id
+        ):
+            if entity.domain != "sensor":
+                continue
+            for suffix in _HOMEKIT_UNIQUE_ID_SUFFIXES:
+                if not entity.unique_id.endswith(suffix):
+                    continue
+                homekit_sn = entity.unique_id.removesuffix(suffix)
+                # 8.0.0 "powerflow-*" IDs are migrated by the sensor platform.
+                if homekit_sn and homekit_sn != "powerflow":
+                    return homekit_sn
+        return None
 
     async def _async_get_energy_storage_cabinets(
         self, data_result: dict[str, Any]
@@ -357,10 +388,13 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
                     homekit_data = {}
                 powerflow["sn"] = homekit_data.get("sn")
 
-                # Goodwe 'Power Meter' (not HomeKit) doesn't have a sn
-                # Let's put something in, otherwise we can't see the data.
+                # Goodwe 'Power Meter' (not HomeKit) doesn't have a sn, and the
+                # SEMS+ Web fallback never reports one. Reuse the serial of existing
+                # HomeKit entities so their unique IDs and history stay intact.
                 if powerflow["sn"] is None:
-                    powerflow["sn"] = "GW-HOMEKIT-NO-SERIAL"
+                    powerflow["sn"] = (
+                        self._existing_homekit_sn() or "GW-HOMEKIT-NO-SERIAL"
+                    )
 
                 # _LOGGER.debug("homeKit sn: %s", result["homKit"]["sn"])
                 # This seems more accurate than the Chart_sum

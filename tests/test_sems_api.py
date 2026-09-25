@@ -885,11 +885,12 @@ class TestSemsApi:
             },
         ]
 
+    @patch.object(SemsApi, "getWebStationFlow", return_value={})
     @patch.object(SemsApi, "getWebInverterTelecounting", return_value={})
     @patch.object(SemsApi, "getWebInverterTelemetry", return_value={})
-    @patch.object(SemsApi, "getWebInverterDevices")
+    @patch.object(SemsApi, "getWebStationDevices")
     def test_get_web_data_uses_name_as_model(
-        self, mock_devices, mock_telemetry, mock_telecounting
+        self, mock_devices, mock_telemetry, mock_telecounting, mock_flow
     ):
         """Test SEMS+ fallback combines the device name and subtype as model."""
         mock_devices.return_value = [
@@ -922,6 +923,7 @@ class TestSemsApi:
             "station", "SN1", False, 2, device_type="INVERTER"
         )
 
+    @patch.object(SemsApi, "getWebStationFlow", return_value={})
     @patch.object(
         SemsApi,
         "getWebInverterTelecounting",
@@ -935,9 +937,9 @@ class TestSemsApi:
         },
     )
     @patch.object(SemsApi, "getWebInverterTelemetry", return_value={})
-    @patch.object(SemsApi, "getWebInverterDevices")
+    @patch.object(SemsApi, "getWebStationDevices")
     def test_get_web_data_preserves_counters_without_live_telemetry(
-        self, mock_devices, mock_telemetry, mock_telecounting
+        self, mock_devices, mock_telemetry, mock_telecounting, mock_flow
     ):
         """Test a waiting inverter response with counters but no live telemetry."""
         mock_devices.return_value = [
@@ -1092,6 +1094,186 @@ class TestSemsApi:
             "eyear": 2345.67,
             "etotal": 12345.67,
         }
+
+    @patch.object(SemsApi, "getWebStationFlow")
+    @patch.object(SemsApi, "getWebSmartMeterCounters")
+    @patch.object(
+        SemsApi,
+        "getWebInverterTelecounting",
+        return_value={"eday": 30.3, "etotal": 16851.0},
+    )
+    @patch.object(SemsApi, "getWebInverterTelemetry", return_value={"pac": 2280.0})
+    @patch.object(SemsApi, "getWebStationDevices")
+    def test_get_web_data_restores_smart_meter_powerflow(
+        self,
+        mock_devices,
+        mock_telemetry,
+        mock_telecounting,
+        mock_meter_counters,
+        mock_flow,
+    ):
+        """Test a SEMS+ smart meter restores legacy powerflow and statistics."""
+        mock_devices.return_value = [
+            {"sn": "SN1", "name": "Inverter", "deviceType": "INVERTER"},
+            {"sn": "METER1", "name": "Meter", "deviceType": "SMART_METER"},
+        ]
+        mock_meter_counters.return_value = {
+            "Today_buy": 5.12,
+            "Today_sell": 23.22,
+            "Total_buy": 3977.33,
+            "Total_sell": 12901.2,
+        }
+        mock_flow.return_value = {
+            "pSystem": 2.28,
+            "pConsum": 0.5,
+            "pGrid": 1.78,
+            "consumFlag": False,
+        }
+
+        result = self.api.getWebData("station")
+
+        assert [inv["invert_full"]["sn"] for inv in result["inverter"]] == ["SN1"]
+        mock_meter_counters.assert_called_once_with(
+            "station", "METER1", False, 2, device_type="SMART_METER"
+        )
+        assert result["hasPowerflow"] is True
+        assert result["homKit"] == {"sn": None}
+        assert result["powerflow"] == {
+            "pv": 2280.0,
+            "load": 500.0,
+            "grid": 1780.0,
+            "gridStatus": 1,
+            "loadStatus": -1,
+        }
+        assert result["hasEnergeStatisticsCharts"] is True
+        # Values and rates match the legacy statistics in the HomeKit fixture.
+        assert result["energeStatisticsCharts"] == {
+            "buy": 5.12,
+            "sell": 23.22,
+            "sum": 30.3,
+            "selfUseOfPv": 7.08,
+            "consumptionOfLoad": 12.2,
+            "contributingRate": 0.5803,
+            "selfUseRate": 0.2337,
+        }
+        assert result["energeStatisticsTotals"]["buy"] == 3977.33
+        assert result["energeStatisticsTotals"]["sell"] == 12901.2
+        assert result["energeStatisticsTotals"]["sum"] == 16851.0
+
+    @patch.object(SemsApi, "getWebStationFlow", return_value={"pSystem": 2.28})
+    @patch.object(SemsApi, "getWebInverterTelecounting", return_value={})
+    @patch.object(SemsApi, "getWebInverterTelemetry", return_value={})
+    @patch.object(SemsApi, "getWebStationDevices")
+    def test_get_web_data_without_meter_has_no_powerflow(
+        self, mock_devices, mock_telemetry, mock_telecounting, mock_flow
+    ):
+        """Test PV-only stations do not gain HomeKit entities from station flow."""
+        mock_devices.return_value = [
+            {"sn": "SN1", "name": "Inverter", "deviceType": "INVERTER"}
+        ]
+
+        result = self.api.getWebData("station")
+
+        assert "hasPowerflow" not in result
+        assert "powerflow" not in result
+
+    @patch.object(SemsApi, "getWebStationFlow", return_value={})
+    @patch.object(SemsApi, "getWebInverterTelemetry", return_value={})
+    @patch.object(SemsApi, "getWebStationDevices")
+    def test_get_web_data_uses_inverter_counters_without_meter_device(
+        self, mock_devices, mock_telemetry, mock_flow
+    ):
+        """Test hybrid inverter import/export counters are used without a meter."""
+        mock_devices.return_value = [
+            {"sn": "SN1", "name": "Inverter", "deviceType": "INVERTER"}
+        ]
+        with patch.object(
+            SemsApi,
+            "_make_api_call",
+            return_value=[
+                {
+                    "code": "telecounting_today",
+                    "factors": [
+                        {"code": "proPvStatsToday", "data": "10", "unit": "kWh"},
+                        {"code": "proPurchaseStatsToday", "data": "2", "unit": "kWh"},
+                        {"code": "proGridStatsToday", "data": "4", "unit": "kWh"},
+                        {"code": "proCharStatsToday", "data": "1", "unit": "kWh"},
+                    ],
+                }
+            ],
+        ):
+            result = self.api.getWebData("station")
+
+        inverter = result["inverter"][0]["invert_full"]
+        assert "_station_counters" not in inverter
+        # Storage counters present: self use/consumption are not derived.
+        assert result["energeStatisticsCharts"] == {
+            "buy": 2.0,
+            "sell": 4.0,
+            "charge": 1.0,
+            "sum": 10.0,
+        }
+        assert result["energeStatisticsTotals"] == {}
+
+    def test_extract_web_station_counters_converts_units(self):
+        """Test station counters are normalized to kWh."""
+        assert self.api._extract_web_station_counters(
+            [
+                {
+                    "code": "telecounting_today",
+                    "factors": [
+                        {"code": "proPurchaseStatsToday", "data": "1500", "unit": "Wh"},
+                        {"code": "proGridStatsWeek", "data": "9", "unit": "kWh"},
+                        {"code": "proGridStatsTotal", "data": "1.5", "unit": "MWh"},
+                        {"code": "proConsumStatsToday", "data": "--", "unit": "kWh"},
+                    ],
+                }
+            ]
+        ) == {"Today_buy": 1.5, "Total_sell": 1500.0}
+
+    def test_build_web_powerflow_import_and_battery_signs(self):
+        """Test grid import and battery charging map to legacy status signs."""
+        assert self.api._build_web_powerflow(
+            {"pConsum": 3.0, "pGrid": -2.5, "pBat": -0.5, "soc": 55}
+        ) == {
+            "load": 3000.0,
+            "grid": 2500.0,
+            "gridStatus": -1,
+            "bettery": 500.0,
+            "betteryStatus": -1,
+            "loadStatus": 1,
+            "soc": 55.0,
+        }
+
+    @patch.object(SemsApi, "_make_api_call")
+    def test_get_web_smart_meter_counters_falls_back_to_ct(self, mock_api_call):
+        """Test meter counters are read from the first CT when the meter has none."""
+        mock_api_call.side_effect = [
+            [],
+            {"deviceList": [{"sn": "CT1"}]},
+            [
+                {
+                    "code": "telecounting_lifetime",
+                    "factors": [
+                        {"code": "proPurchaseStatsTotal", "data": "12", "unit": "kWh"}
+                    ],
+                }
+            ],
+        ]
+
+        assert self.api.getWebSmartMeterCounters("station", "METER1") == {
+            "Total_buy": 12.0
+        }
+        urls = [call.args[0] for call in mock_api_call.call_args_list]
+        assert urls[0].endswith(
+            "equipments/METER1/telecounting?deviceType=SMART_METER&pwId=station"
+        )
+        assert urls[1].endswith(
+            "equipments/METER1/meterCtData?deviceType=SMART_METER&pwId=station"
+        )
+        assert urls[2].endswith(
+            "equipments/CT1/telecounting?deviceType=SMART_METER&pwId=station"
+        )
 
     @patch.object(SemsApi, "_make_api_call")
     def test_get_battery_system_telemetry(self, mock_api_call):

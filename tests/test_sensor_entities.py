@@ -192,6 +192,61 @@ async def test_unique_id_migration_sn_to_sn_power(
     assert migrated_entry.unique_id == "GW0000SN000TEST1-power"
 
 
+async def test_web_fallback_meter_data_reuses_existing_homekit_entities(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+) -> None:
+    """Test SEMS+ meter data feeds existing HomeKit entities by unique ID."""
+    del enable_custom_integrations
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Test",
+        data={
+            CONF_USERNAME: "user",
+            CONF_PASSWORD: "pass",
+            CONF_STATION_ID: MOCK_POWER_STATION_ID,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    ent_reg = er.async_get(hass)
+    existing_entity_id = ent_reg.async_get_or_create(
+        Platform.SENSOR,
+        DOMAIN,
+        "HOMEKIT-SN-1-import-energy-total",
+        config_entry=entry,
+    ).entity_id
+
+    web_data = {
+        "inverter": MOCK_GET_DATA_RESULT_MINIMAL["inverter"],
+        "hasPowerflow": True,
+        "powerflow": {"pv": 589.0, "grid": 1200.0, "gridStatus": -1},
+        "homKit": {"sn": None},
+        "hasEnergeStatisticsCharts": True,
+        "energeStatisticsCharts": {"buy": 5.12, "sell": 23.22},
+        "energeStatisticsTotals": {"buy": 3977.33, "sell": 12901.2},
+    }
+    with _mock_no_battery_api(web_data):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    state = hass.states.get(existing_entity_id)
+    assert state is not None
+    assert float(state.state) == 3977.33
+
+    export_entity_id = ent_reg.async_get_entity_id(
+        Platform.SENSOR, DOMAIN, "HOMEKIT-SN-1-export-energy"
+    )
+    assert export_entity_id is not None
+    assert float(hass.states.get(export_entity_id).state) == 23.22
+    assert (
+        ent_reg.async_get_entity_id(
+            Platform.SENSOR, DOMAIN, "GW-HOMEKIT-NO-SERIAL-import-energy-total"
+        )
+        is None
+    )
+
+
 async def test_unique_id_migration_powerflow_to_homekit_sn(
     hass: HomeAssistant,
     enable_custom_integrations: None,

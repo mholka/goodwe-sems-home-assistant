@@ -94,6 +94,9 @@ related-device discovery.
 | `getLoginToken` | `POST /api/v3/Common/CrossLogin` (legacy fallback) or `POST /web/sems/sems-user/api/v1/auth/cross-login` (SEMS+ login) | Legacy token or SEMS+ Web token, depending on the successful login |
 | `getPowerStationIds` | `POST /PowerStation/GetPowerStationIdByOwner` | Legacy token |
 | `getData` | `POST /v3/PowerStation/GetMonitorDetailByPowerstationId` with `powerStationId` | Legacy token; affected accounts can receive an empty `data` object |
+| `getWebStationDevices` | `GET /web/sems/sems-plant/api/stations/device/all-status?stationId=<station_id>` (inverters, storage cabinets, and `SMART_METER` devices) | SEMS+ Web token |
+| `getWebStationFlow` | `GET /web/sems/sems-plant/api/stations/flow?stationId=<station_id>`; with a meter the Web UI reads `pSystem`, `pConsum`, `pGrid` (positive = export), `pBat` (negative = charging), and `soc`, all power values in kW | SEMS+ Web token |
+| `getWebSmartMeterCounters` | `GET /web/sems/sems-plant/api/equipments/<meter_sn>/telecounting?deviceType=SMART_METER&pwId=<station_id>`, falling back to the first CT from `GET .../equipments/<meter_sn>/meterCtData?deviceType=SMART_METER&pwId=<station_id>`; `proPurchaseStats*` = import, `proGridStats*` = export | SEMS+ Web token |
 | `getEnergyStorageIntegratedCabinets` | `GET /web/sems/sems-plant/api/equipments/<sn>/relatedDevices?sn=<sn>&deviceType=ENERGY_STORAGE_INTEGRATED_CABINET&pwId=<station_id>` | SEMS+ Web token |
 | `getBatteryGeneralFunctions` | `POST /web/sems/sems-remote/api/v2/address/remote/getDeviceFunctionTabMenus` | SEMS+ Web token |
 | `getBatteryImmediateChargingStates` | `POST /web/sems/sems-remote/api/v1/address/remote/get-cache-device-function-parameters` | SEMS+ Web token |

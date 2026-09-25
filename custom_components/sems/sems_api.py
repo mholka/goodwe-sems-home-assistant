@@ -12,7 +12,7 @@ import requests
 from homeassistant import exceptions
 from homeassistant.core import HomeAssistant
 
-from .const import redact_for_log
+from .const import GOODWE_SPELLING, redact_for_log
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,7 +24,28 @@ _PowerControlURLPart = "/PowerStation/SaveRemoteControlInverter"
 _WebDeviceStatusURLPart = "/sems-plant/api/stations/device/all-status"
 _WebTelemetryURLPart = "/sems-plant/api/equipments/{serial_number}/telemetry"
 _WebTelecountingURLPart = "/sems-plant/api/equipments/{serial_number}/telecounting"
+_WebMeterCtDataURLPart = "/sems-plant/api/equipments/{serial_number}/meterCtData"
+_WebStationFlowURLPart = "/sems-plant/api/stations/flow"
 _SUPPORTED_WEB_DEVICE_TYPES = {"INVERTER", "ENERGY_STORAGE_INTEGRATED_CABINET"}
+_SUPPORTED_WEB_METER_TYPES = {"SMART_METER"}
+# SEMS+ telecounting factor prefixes mapped to the legacy energy statistics keys.
+# Each prefix is suffixed with "Today" (daily charts) or "Total" (lifetime totals).
+_WebStationCounterPrefixes = {
+    "proPurchaseStats": "buy",
+    "proGridStats": "sell",
+    "proConsumStats": "consumptionOfLoad",
+    "proSelfConsumStats": "selfUseOfPv",
+    "proCharStats": "charge",
+    "proDischarStats": "disCharge",
+}
+# SEMS+ station-flow power codes (kW) mapped to legacy powerflow keys. The Web UI
+# treats a positive pGrid as export and a negative pBat as charging.
+_WebFlowPowerCodes = {
+    "pSystem": "pv",
+    "pConsum": "load",
+    "pGrid": "grid",
+    "pBat": "bettery",
+}
 # SEMS+ Web data requests use GET with stationId/pwId query parameters and the
 # Web token plus X-Signature headers; the legacy monitor request uses POST with
 # {"powerStationId": "<station_id>"} and the legacy token header.
@@ -629,10 +650,31 @@ class SemsApi:
         self, powerStationId: str, renewToken: bool = False, maxTokenRetries: int = 2
     ) -> dict[str, Any]:
         """Build the legacy coordinator shape from SEMS+ Web responses."""
+        devices = self.getWebStationDevices(
+            powerStationId,
+            _SUPPORTED_WEB_DEVICE_TYPES | _SUPPORTED_WEB_METER_TYPES,
+            renewToken,
+            maxTokenRetries,
+        )
         inverters: list[dict[str, Any]] = []
-        for device in self.getWebInverterDevices(
-            powerStationId, renewToken, maxTokenRetries
-        ):
+        station_counters: list[tuple[str, dict[str, float]]] = []
+        for device in devices:
+            if device.get("deviceType") in _SUPPORTED_WEB_METER_TYPES:
+                serial_number = device.get("sn")
+                if isinstance(serial_number, str):
+                    station_counters.append(
+                        (
+                            device["deviceType"],
+                            self.getWebSmartMeterCounters(
+                                powerStationId,
+                                serial_number,
+                                renewToken,
+                                maxTokenRetries,
+                                device_type=device["deviceType"],
+                            ),
+                        )
+                    )
+                continue
             serial_number = device.get("sn")
             if not isinstance(serial_number, str):
                 continue
@@ -656,6 +698,9 @@ class SemsApi:
                     device_type=device_type,
                 ),
             }
+            station_counters.append(
+                (device_type, inverter.pop("_station_counters", {}))
+            )
             inverter.setdefault("powerstation_id", powerStationId)
             if "model_type" not in inverter:
                 name = inverter.get("name")
@@ -666,7 +711,241 @@ class SemsApi:
                     else name or subtype or "unknown"
                 )
             inverters.append({"invert_full": inverter})
-        return {"inverter": inverters}
+        result: dict[str, Any] = {"inverter": inverters}
+        if not inverters:
+            return result
+
+        charts, totals = self._build_web_energy_statistics(
+            station_counters, [inverter["invert_full"] for inverter in inverters]
+        )
+        powerflow = self._build_web_powerflow(
+            self.getWebStationFlow(powerStationId, renewToken, maxTokenRetries)
+        )
+        has_meter_flow = any(key in powerflow for key in ("grid", "load"))
+        if not has_meter_flow and not charts and not totals:
+            return result
+
+        result["hasPowerflow"] = True
+        result["powerflow"] = powerflow
+        result[GOODWE_SPELLING.homeKit] = {"sn": None}
+        if charts or totals:
+            result[GOODWE_SPELLING.hasEnergyStatisticsCharts] = True
+            result[GOODWE_SPELLING.energyStatisticsCharts] = charts
+            result[GOODWE_SPELLING.energyStatisticsTotals] = totals
+        return result
+
+    def getWebStationFlow(
+        self, powerStationId: str, renewToken: bool = False, maxTokenRetries: int = 2
+    ) -> dict[str, Any]:
+        """Get the live station power flow from SEMS+ Web."""
+        try:
+            result = self._make_api_call(
+                f"{_WebStationFlowURLPart}?stationId={powerStationId}",
+                method="GET",
+                renewToken=renewToken,
+                maxTokenRetries=maxTokenRetries,
+                operation_name="getWebStationFlow API call",
+                is_web=True,
+            )
+        except OutOfRetries:
+            _LOGGER.debug("SEMS+ station flow unavailable; skipping power flow")
+            return {}
+        return result if isinstance(result, dict) else {}
+
+    def getWebSmartMeterCounters(
+        self,
+        powerStationId: str,
+        serialNumber: str,
+        renewToken: bool = False,
+        maxTokenRetries: int = 2,
+        device_type: str = "SMART_METER",
+    ) -> dict[str, float]:
+        """Get import/export energy counters for a SEMS+ smart meter.
+
+        The Web UI reads meter values for the first CT listed by meterCtData,
+        so fall back to that CT when the meter itself reports no counters.
+        """
+        counters = self._get_web_station_counters(
+            powerStationId, serialNumber, renewToken, maxTokenRetries, device_type
+        )
+        if counters:
+            return counters
+
+        try:
+            ct_data = self._make_api_call(
+                f"{_WebMeterCtDataURLPart.format(serial_number=serialNumber)}"
+                f"?deviceType={device_type}&pwId={powerStationId}",
+                method="GET",
+                renewToken=renewToken,
+                maxTokenRetries=maxTokenRetries,
+                operation_name="getWebSmartMeterCtData API call",
+                is_web=True,
+            )
+        except OutOfRetries:
+            return {}
+        device_list = ct_data.get("deviceList") if isinstance(ct_data, dict) else None
+        if not isinstance(device_list, list) or not device_list:
+            return {}
+        ct_serial = (
+            device_list[0].get("sn") if isinstance(device_list[0], dict) else None
+        )
+        if not isinstance(ct_serial, str) or ct_serial == serialNumber:
+            return {}
+        return self._get_web_station_counters(
+            powerStationId, ct_serial, renewToken, maxTokenRetries, device_type
+        )
+
+    def _get_web_station_counters(
+        self,
+        powerStationId: str,
+        serialNumber: str,
+        renewToken: bool,
+        maxTokenRetries: int,
+        device_type: str,
+    ) -> dict[str, float]:
+        """Fetch telecounting for a device and extract station energy counters."""
+        try:
+            result = self._make_api_call(
+                f"{_WebTelecountingURLPart.format(serial_number=serialNumber)}"
+                f"?deviceType={device_type}&pwId={powerStationId}",
+                method="GET",
+                renewToken=renewToken,
+                maxTokenRetries=maxTokenRetries,
+                operation_name="getWebSmartMeterTelecounting API call",
+                is_web=True,
+            )
+        except OutOfRetries:
+            _LOGGER.debug("SEMS+ %s telecounting unavailable", device_type)
+            return {}
+        return self._extract_web_station_counters(
+            result if isinstance(result, list) else None
+        )
+
+    @staticmethod
+    def _extract_web_station_counters(
+        response: list[dict[str, Any]] | None,
+    ) -> dict[str, float]:
+        """Return station energy counters in kWh keyed like `Today_buy`."""
+        energy_scale = {"wh": 0.001, "kwh": 1.0, "mwh": 1000.0}
+        counters: dict[str, float] = {}
+        for group in response or []:
+            if not isinstance(group, dict):
+                continue
+            for factor in group.get("factors", []):
+                if not isinstance(factor, dict):
+                    continue
+                code = factor.get("code")
+                if not isinstance(code, str):
+                    continue
+                for prefix, key in _WebStationCounterPrefixes.items():
+                    period = code.removeprefix(prefix)
+                    if period == code or period not in ("Today", "Total"):
+                        continue
+                    try:
+                        value = float(factor.get("data"))
+                    except (TypeError, ValueError):
+                        continue
+                    unit = factor.get("unit")
+                    scale = (
+                        energy_scale.get(unit.lower(), 1.0)
+                        if isinstance(unit, str)
+                        else 1.0
+                    )
+                    counters[f"{period}_{key}"] = value * scale
+        return counters
+
+    @staticmethod
+    def _build_web_energy_statistics(
+        station_counters: list[tuple[str, dict[str, float]]],
+        inverters: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build legacy daily chart and lifetime total dicts from Web counters."""
+        merged: dict[str, float] = {}
+        meter_counters = [
+            counters
+            for device_type, counters in station_counters
+            if device_type in _SUPPORTED_WEB_METER_TYPES
+        ]
+        other_counters = [
+            counters
+            for device_type, counters in station_counters
+            if device_type not in _SUPPORTED_WEB_METER_TYPES
+        ]
+        keys = {key for _, counters in station_counters for key in counters}
+        for key in keys:
+            # Prefer the grid meter for a counter so inverter values that describe
+            # the same energy flow are not counted twice.
+            sources = [c for c in meter_counters if key in c] or [
+                c for c in other_counters if key in c
+            ]
+            merged[key] = sum(counters[key] for counters in sources)
+
+        def pv_sum(field: str) -> float | None:
+            values = [
+                inverter[field]
+                for inverter in inverters
+                if isinstance(inverter.get(field), (int, float))
+            ]
+            return sum(values) if values else None
+
+        result: dict[str, dict[str, Any]] = {}
+        for period, pv_field in (("Today", "eday"), ("Total", "etotal")):
+            stats = {
+                key.removeprefix(f"{period}_"): value
+                for key, value in merged.items()
+                if key.startswith(f"{period}_")
+            }
+            if "buy" not in stats and "sell" not in stats:
+                result[period] = {}
+                continue
+            pv = pv_sum(pv_field)
+            if pv is not None:
+                stats["sum"] = pv
+            has_storage = "charge" in stats or "disCharge" in stats
+            # Without storage the legacy statistics follow from PV and meter data:
+            # self use = PV - export and consumption = self use + import.
+            if not has_storage and pv is not None and "sell" in stats:
+                stats.setdefault("selfUseOfPv", max(pv - stats["sell"], 0.0))
+                if "buy" in stats:
+                    stats.setdefault(
+                        "consumptionOfLoad", stats["selfUseOfPv"] + stats["buy"]
+                    )
+            self_use = stats.get("selfUseOfPv")
+            if self_use is not None:
+                if stats.get("consumptionOfLoad"):
+                    stats["contributingRate"] = self_use / stats["consumptionOfLoad"]
+                if pv:
+                    stats["selfUseRate"] = self_use / pv
+            result[period] = {
+                key: round(value, 4) if key.endswith("Rate") else round(value, 2)
+                for key, value in stats.items()
+            }
+        return result["Today"], result["Total"]
+
+    @staticmethod
+    def _build_web_powerflow(flow: dict[str, Any]) -> dict[str, Any]:
+        """Convert SEMS+ station flow (kW) to the legacy powerflow shape (W)."""
+        powerflow: dict[str, Any] = {}
+        for code, key in _WebFlowPowerCodes.items():
+            try:
+                value = float(flow[code]) * 1000
+            except (KeyError, TypeError, ValueError):
+                continue
+            powerflow[key] = round(abs(value), 1)
+            if key == "grid":
+                # Legacy gridStatus: 1 = export, -1 = import.
+                powerflow["gridStatus"] = (value > 0) - (value < 0)
+            elif key == "bettery":
+                # Legacy battery sign: positive = discharge, negative = charge.
+                powerflow[GOODWE_SPELLING.batteryStatus] = (value > 0) - (value < 0)
+        if "load" in powerflow:
+            # Legacy loadStatus mirrors the grid direction: 1 = import, -1 = export.
+            powerflow["loadStatus"] = -1 if powerflow.get("gridStatus") == 1 else 1
+        try:
+            powerflow["soc"] = float(flow["soc"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        return powerflow
 
     @staticmethod
     def _flatten_web_factors(
@@ -700,6 +979,18 @@ class SemsApi:
         self, powerStationId: str, renewToken: bool = False, maxTokenRetries: int = 2
     ) -> list[dict[str, Any]]:
         """Discover inverter devices through the SEMS+ Web API."""
+        return self.getWebStationDevices(
+            powerStationId, _SUPPORTED_WEB_DEVICE_TYPES, renewToken, maxTokenRetries
+        )
+
+    def getWebStationDevices(
+        self,
+        powerStationId: str,
+        device_types: set[str],
+        renewToken: bool = False,
+        maxTokenRetries: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Discover station devices of the given types through the SEMS+ Web API."""
         result = self._make_api_call(
             f"{_WebDeviceStatusURLPart}?stationId={powerStationId}",
             method="GET",
@@ -715,7 +1006,7 @@ class SemsApi:
             if not isinstance(device_group, dict):
                 continue
             device_type = device_group.get("deviceType")
-            if device_type not in _SUPPORTED_WEB_DEVICE_TYPES:
+            if device_type not in device_types:
                 continue
             for status_group in device_group.get("statusDetailList", []):
                 if not isinstance(status_group, dict):
@@ -822,6 +1113,11 @@ class SemsApi:
         ):
             if (value := self._numeric_web_factor(factors, source)) is not None:
                 counters[target] = value
+        if station_counters := self._extract_web_station_counters(
+            result if isinstance(result, list) else None
+        ):
+            # Consumed by getWebData for station energy statistics.
+            counters["_station_counters"] = station_counters
         return counters
 
     def getEnergyStorageIntegratedCabinets(
