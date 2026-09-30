@@ -130,6 +130,7 @@ _WEB_TELECOUNTING_ENDPOINT = ApiEndpoint(
     "/sems-plant/api/equipments/{serial_number}/telecounting", "web"
 )
 _WEB_STATION_FLOW_ENDPOINT = ApiEndpoint("/sems-plant/api/stations/flow", "web")
+_WEB_ALARM_COUNT_ENDPOINT = ApiEndpoint("/sems-alarm/api/alarm/count", "web")
 _WEB_STATION_LIST_ENDPOINT = ApiEndpoint("/sems-plant/api/portal/stations/page", "web")
 _WEB_STATION_STATISTICS_ENDPOINT = ApiEndpoint(
     "/sems-plant/api/stations/statistics", "web"
@@ -1491,6 +1492,56 @@ class SemsApi:
             token_type=_WEB_STATION_FLOW_ENDPOINT.token_type,
         )
         return result if isinstance(result, dict) else {}
+
+    def getWebAlarmCount(
+        self, renewToken: bool = False, maxTokenRetries: int = 2
+    ) -> dict[str, Any] | None:
+        """Get the number of active SEMS+ alarms on the account.
+
+        Returns `{"count": int, "details": response}`, or None when the request
+        fails or the response has no recognisable count, so an alarm outage
+        never blocks the station data.
+        """
+        try:
+            result = self._make_api_call(
+                _WEB_ALARM_COUNT_ENDPOINT.url_part,
+                method="GET",
+                renewToken=renewToken,
+                maxTokenRetries=maxTokenRetries,
+                operation_name="getWebAlarmCount API call",
+                is_web=True,
+                retry_on_api_error=False,
+                token_type=_WEB_ALARM_COUNT_ENDPOINT.token_type,
+            )
+        except (OutOfRetries, SemsRateLimitedError) as err:
+            _LOGGER.debug("SEMS alarm count unavailable: %s", err)
+            return None
+        _LOGGER.debug("SEMS alarm count response: %s", redact_for_log(result))
+        count = self._alarm_count(result)
+        if count is None:
+            return None
+        return {"count": count, "details": result if isinstance(result, dict) else {}}
+
+    @staticmethod
+    def _alarm_count(result: Any) -> int | None:
+        """Return the alarm count from a number or an object of counts."""
+
+        def as_int(value: Any) -> int | None:
+            if isinstance(value, bool):
+                return None
+            try:
+                return int(value)
+            except TypeError, ValueError:
+                return None
+
+        if not isinstance(result, dict):
+            return as_int(result)
+        for key in ("count", "total", "alarmCount", "totalCount"):
+            if (count := as_int(result.get(key))) is not None:
+                return count
+        # e.g. counts per alarm level
+        counts = [c for c in map(as_int, result.values()) if c is not None]
+        return sum(counts) if counts else None
 
     @staticmethod
     def _normalize_web_homekit_data(

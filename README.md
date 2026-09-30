@@ -56,6 +56,18 @@ waiting, offline, or not producing. SEMS+ may omit live telemetry in that
 state while still returning historical energy counters. The integration does
 not replace missing values with zero.
 
+### Active alarms
+
+When SEMS+ reports alarms for the account, a **SEMS Station** device is added
+with an **Active Alarms** sensor. It shows the number of active alarms, and
+any per-level counts SEMS+ returns are shown as attributes. Use it to be
+notified when the inverter or another device reports a fault. SEMS+ counts
+alarms for the whole account, so with several stations the count can include
+alarms from the others.
+
+The sensor becomes `unavailable` while SEMS+ can't be reached, rather than
+showing zero alarms.
+
 ### Optional: control the inverter power output via the "Inverter Control" switch
 
 It is possible to temporarily pause and resume energy production using the

@@ -946,7 +946,10 @@ async def async_setup_entry(
                 sensor_option.entity_registry_enabled_default,
             )
         )
-    async_add_entities(sensors)
+    entities: list[SensorEntity] = [*sensors]
+    if coordinator.data.alarms is not None:
+        entities.append(SemsAlarmSensor(coordinator))
+    async_add_entities(entities)
 
 
 def _migrate_unique_ids(hass: HomeAssistant, migrations: dict[str, str]) -> None:
@@ -1263,3 +1266,40 @@ class SemsLegacyPowerflowSensor(SemsHomekitSensor):
             attributes["PowerFlowDirection"] = f"Import {data.get('grid')}"
 
         return attributes
+
+
+class SemsAlarmSensor(CoordinatorEntity[SemsCoordinator], SensorEntity):
+    """Number of active alarms reported by SEMS+ for the account."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Active Alarms"
+    _attr_icon = "mdi:alert-circle-outline"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: SemsCoordinator) -> None:
+        """Initialize the alarm sensor on the station device."""
+        super().__init__(coordinator)
+        station_id = coordinator.station_id
+        self._attr_unique_id = f"{station_id}-active-alarms"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"station-{station_id}")},
+            name="SEMS Station",
+            manufacturer="GoodWe",
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return False while the alarm count cannot be read."""
+        return super().available and self.coordinator.data.alarms is not None
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the number of active alarms."""
+        alarms = self.coordinator.data.alarms
+        return alarms["count"] if alarms else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the counts SEMS+ reports alongside the total."""
+        alarms = self.coordinator.data.alarms
+        return dict(alarms["details"]) if alarms else {}

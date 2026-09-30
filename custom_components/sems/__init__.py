@@ -154,6 +154,7 @@ class SemsData:
     immediate_charging: dict[str, dict[str, Any]] | None = None
     homekit: dict[str, Any] | None = None
     currency: str | None = None
+    alarms: dict[str, Any] | None = None
     unavailable_inverter_sources: dict[str, set[str]] = field(default_factory=dict)
     unavailable_homekit_sources: set[str] = field(default_factory=set)
 
@@ -362,6 +363,16 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
 
         return immediate_charging
 
+    async def _async_get_alarms(self) -> dict[str, Any] | None:
+        """Fetch the SEMS+ alarm count without failing the station update."""
+        try:
+            return await self.hass.async_add_executor_job(
+                self.sems_api.getWebAlarmCount
+            )
+        except Exception as err:
+            _LOGGER.debug("SEMS alarm count unavailable: %s", err)
+            return None
+
     async def _async_update_data(self) -> SemsData:
         """Fetch data from API endpoint.
 
@@ -381,6 +392,7 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
             )
             batteries = await self._async_get_battery_functions(energy_storage_cabinets)
             immediate_charging = await self._async_get_immediate_charging(batteries)
+            alarms = await self._async_get_alarms()
 
         except SemsAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
@@ -525,6 +537,7 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
                 homekit=homekit,
                 currency=currency,
                 immediate_charging=immediate_charging,
+                alarms=alarms,
                 unavailable_inverter_sources=unavailable_inverter_sources,
                 unavailable_homekit_sources=raw_homekit_sources,
             )

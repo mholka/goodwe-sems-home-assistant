@@ -1,5 +1,13 @@
 # Release notes
 
+## Unreleased
+
+## Add active alarms sensor
+
+- Add an Active Alarms sensor with the number of active SEMS+ alarms, for
+  fault notifications. Per-level counts are shown as attributes.
+- A failing alarm request never blocks the inverter and power-flow data.
+
 ## 11.12.0-beta.6 - 2026-09-29
 
 ## Mark failed SEMS+ data unavailable
