@@ -23,6 +23,7 @@ from homeassistant.const import (
     UnitOfFrequency,
     UnitOfPower,
     UnitOfTemperature,
+    UnitOfTime,
 )
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -45,7 +46,7 @@ EV_CHARGER_STATUS_LABELS = {
 _EV_CHARGER_CHARGING_STATUS = 6
 
 # SEMS+ charge modes, as listed by the Web UI mode selector.
-EV_CHARGE_MODES = {0: "fast", 1: "pv", 2: "pv_battery"}
+EV_CHARGE_MODES = {0: "Fast", 1: "PV", 2: "PV + battery"}
 
 # Unit -> (device class, HA unit, state class) for dynamic factor sensors.
 _UNIT_MAP: dict[str, tuple[SensorDeviceClass | None, str, SensorStateClass]] = {
@@ -140,7 +141,7 @@ class _EvChargerEntity(CoordinatorEntity[SemsCoordinator]):
     def _work_status(self) -> int | None:
         try:
             return int(self._charger.get("charge_log", {}).get("workStu"))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
 
     @property
@@ -151,7 +152,7 @@ class _EvChargerEntity(CoordinatorEntity[SemsCoordinator]):
             value = self._charger.get(source, {}).get("chargeMode")
             try:
                 return int(value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
         return None
 
@@ -193,10 +194,123 @@ class EvChargerStatusSensor(_EvChargerEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         charge_log = self._charger.get("charge_log", {})
-        return {
+        attributes = {
             "work_status_code": charge_log.get("workStu"),
             "plug_status_code": charge_log.get("status"),
         }
+        for source, target in (
+            ("chargeStartTime", "last_session_start"),
+            ("chargeEndTime", "last_session_end"),
+            ("chargeEndCauseDetail", "last_session_end_reason"),
+        ):
+            if charge_log.get(source) not in (None, ""):
+                attributes[target] = charge_log[source]
+        return attributes
+
+
+class EvChargerPlugSensor(_EvChargerEntity, SensorEntity):
+    """Whether a vehicle is plugged in (`chargeLog.status`, 0 = unplugged)."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_icon = "mdi:ev-plug-type2"
+
+    def __init__(self, coordinator: SemsCoordinator, serial_number: str) -> None:
+        super().__init__(coordinator, serial_number, "plug")
+        self._attr_name = "Plug"
+        self._attr_options = ["Connected", "Disconnected"]
+
+    @property
+    def native_value(self) -> str | None:
+        status = self._charger.get("charge_log", {}).get("status")
+        if status is None:
+            return None
+        try:
+            return "Connected" if int(status) else "Disconnected"
+        except TypeError, ValueError:
+            return None
+
+
+class EvChargerPowerSensor(_EvChargerEntity, SensorEntity):
+    """Live charging power from the station power flow (`pEvChar`)."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: SemsCoordinator, serial_number: str) -> None:
+        super().__init__(coordinator, serial_number, "charging-power")
+        self._attr_name = "Charging Power"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._charger.get("charging_power")
+
+
+# Last charging session values (`chargeLog`): field -> (name, unit, class, state).
+EV_CHARGER_SESSION_SENSORS: dict[
+    str, tuple[str, str | None, SensorDeviceClass | None, SensorStateClass | None]
+] = {
+    "currentChargeQuantity": (
+        "Session Energy",
+        UnitOfEnergy.KILO_WATT_HOUR,
+        SensorDeviceClass.ENERGY,
+        SensorStateClass.TOTAL_INCREASING,
+    ),
+    "greenElec": (
+        "Session PV Energy",
+        UnitOfEnergy.KILO_WATT_HOUR,
+        SensorDeviceClass.ENERGY,
+        SensorStateClass.TOTAL_INCREASING,
+    ),
+    "purElec": (
+        "Session Grid Energy",
+        UnitOfEnergy.KILO_WATT_HOUR,
+        SensorDeviceClass.ENERGY,
+        SensorStateClass.TOTAL_INCREASING,
+    ),
+    "averCharP": (
+        "Session Average Power",
+        UnitOfPower.KILO_WATT,
+        SensorDeviceClass.POWER,
+        SensorStateClass.MEASUREMENT,
+    ),
+    "maxCharP": (
+        "Session Max Power",
+        UnitOfPower.KILO_WATT,
+        SensorDeviceClass.POWER,
+        SensorStateClass.MEASUREMENT,
+    ),
+    "chargeTimeLength": (
+        "Session Duration",
+        UnitOfTime.MINUTES,
+        SensorDeviceClass.DURATION,
+        SensorStateClass.MEASUREMENT,
+    ),
+    "mileage": ("Session Range Added", None, None, SensorStateClass.MEASUREMENT),
+}
+
+
+class EvChargerSessionSensor(_EvChargerEntity, SensorEntity):
+    """A value of the last charging session."""
+
+    def __init__(
+        self, coordinator: SemsCoordinator, serial_number: str, field: str
+    ) -> None:
+        super().__init__(coordinator, serial_number, f"session-{field}")
+        self._field = field
+        name, unit, device_class, state_class = EV_CHARGER_SESSION_SENSORS[field]
+        self._attr_name = name
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._attr_state_class = state_class
+
+    @property
+    def native_value(self) -> float | None:
+        value = self._charger.get("charge_log", {}).get(self._field)
+        try:
+            return float(value)
+        except TypeError, ValueError:
+            return None
 
 
 class EvChargerFactorSensor(_EvChargerEntity, SensorEntity):
@@ -314,7 +428,7 @@ EV_CHARGER_CONFIG_NUMBERS: dict[str, tuple[str, str, str | None, float]] = {
 class EvChargerConfigSwitch(_EvChargerEntity, SwitchEntity):
     """Toggle one EV charger "More Control" setting."""
 
-    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_category: EntityCategory | None = EntityCategory.CONFIG
 
     def __init__(
         self, coordinator: SemsCoordinator, serial_number: str, field: str
@@ -371,7 +485,7 @@ class EvChargerConfigNumber(_EvChargerEntity, NumberEntity):
         mode_info = self._charger.get("mode_info", {})
         try:
             rated = float(mode_info.get("ratedPower") or 0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             rated = 0.0
         if not rated:
             rated = 22.0
@@ -383,7 +497,7 @@ class EvChargerConfigNumber(_EvChargerEntity, NumberEntity):
         default_max = 63.0 if unit == UnitOfElectricCurrent.AMPERE else max(rated, 22.0)
         try:
             return float(ranges.get("min", 0)), float(ranges.get("max", default_max))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0.0, default_max
 
     @property
@@ -391,7 +505,7 @@ class EvChargerConfigNumber(_EvChargerEntity, NumberEntity):
         value = self._charger.get("detail", {}).get(self._field)
         try:
             return float(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
 
     async def async_set_native_value(self, value: float) -> None:
@@ -417,6 +531,14 @@ def ev_charger_sensors(coordinator: SemsCoordinator) -> list[SensorEntity]:
     sensors: list[SensorEntity] = []
     for serial_number, charger in (coordinator.data.ev_chargers or {}).items():
         sensors.append(EvChargerStatusSensor(coordinator, serial_number))
+        sensors.append(EvChargerPlugSensor(coordinator, serial_number))
+        if "charging_power" in charger:
+            sensors.append(EvChargerPowerSensor(coordinator, serial_number))
+        sensors.extend(
+            EvChargerSessionSensor(coordinator, serial_number, field)
+            for field in EV_CHARGER_SESSION_SENSORS
+            if charger.get("charge_log", {}).get(field) is not None
+        )
         for code, factor in charger.get("factors", {}).items():
             sensors.append(
                 EvChargerFactorSensor(coordinator, serial_number, code, factor)

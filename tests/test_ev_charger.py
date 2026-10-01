@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.sems.const import CONF_STATION_ID, DOMAIN
-from custom_components.sems.sems_api import SemsApi
+from custom_components.sems.ev_charger import (
+    EvChargeModeSelect,
+    EvChargerChargingSwitch,
+    EvChargerConfigNumber,
+    EvChargerConfigSwitch,
+    EvChargerFactorSensor,
+    EvChargerPlugSensor,
+    EvChargerSessionSensor,
+    EvChargerStatusSensor,
+    ev_charger_sensors,
+)
+from custom_components.sems.sems_api import OutOfRetries, SemsApi
 
 STATION_ID = "12345678-1234-5678-9abc-123456789abc"
 CHARGER_SN = "EVC0000SN0TEST1"
@@ -110,7 +124,7 @@ def _web_api() -> SemsApi:
 
 
 @patch.object(SemsApi, "_get_web_energy_statistics", return_value=None)
-@patch.object(SemsApi, "getWebStationFlow", return_value={})
+@patch.object(SemsApi, "getWebStationFlow", return_value={"pEvChar": 7.2})
 def test_get_web_data_collects_ev_charger(mock_flow, mock_statistics):
     """Test an EV_CHARGER device is read separately from inverters."""
     with patch.object(SemsApi, "_make_api_call", side_effect=_fake_api_call):
@@ -121,6 +135,7 @@ def test_get_web_data_collects_ev_charger(mock_flow, mock_statistics):
     assert charger["name"] == "Wallbox"
     assert charger["mode_info"] == MODE_INFO
     assert charger["detail"] == DETAIL
+    assert charger["charging_power"] == 7200
     assert charger["charge_log"] == {"workStu": 6, "status": 1}
     assert charger["factors"] == {
         "Charging_Power": {"value": 7.2, "unit": "kW", "alias": "charging_power"},
@@ -197,7 +212,15 @@ async def test_ev_charger_entities(
                 },
                 "mode_info": MODE_INFO,
                 "detail": DETAIL,
-                "charge_log": {"workStu": 6, "status": 1},
+                "charging_power": 7200.0,
+                "charge_log": {
+                    "workStu": 6,
+                    "status": 1,
+                    "currentChargeQuantity": 3.5,
+                    "greenElec": 2.0,
+                    "chargeTimeLength": 95,
+                    "chargeEndCauseDetail": "user_stop",
+                },
             }
         },
     }
@@ -221,6 +244,26 @@ async def test_ev_charger_entities(
             return hass.states.get(entity_id)
 
         assert state(Platform.SENSOR, "status").state == "Charging"
+        assert (
+            state(Platform.SENSOR, "status").attributes["last_session_end_reason"]
+            == "user_stop"
+        )
+        assert state(Platform.SENSOR, "plug").state == "Connected"
+        charging_power = state(Platform.SENSOR, "charging-power")
+        assert float(charging_power.state) == 7200
+        assert charging_power.attributes["unit_of_measurement"] == "W"
+        assert (
+            float(state(Platform.SENSOR, "session-currentChargeQuantity").state) == 3.5
+        )
+        assert float(state(Platform.SENSOR, "session-greenElec").state) == 2.0
+        duration = state(Platform.SENSOR, "session-chargeTimeLength")
+        assert duration.attributes["unit_of_measurement"] == "min"
+        assert (
+            ent_reg.async_get_entity_id(
+                Platform.SENSOR, DOMAIN, f"{CHARGER_SN}-ev-session-purElec"
+            )
+            is None
+        )
         power = state(Platform.SENSOR, "Charging_Power")
         assert float(power.state) == 7.2
         assert power.attributes["unit_of_measurement"] == "kW"
@@ -232,8 +275,8 @@ async def test_ev_charger_entities(
             "EV Charger Wallbox Start Charging"
         )
         mode = state(Platform.SELECT, "charge-mode")
-        assert mode.state == "pv"
-        assert mode.attributes["options"] == ["fast", "pv", "pv_battery"]
+        assert mode.state == "PV"
+        assert mode.attributes["options"] == ["Fast", "PV", "PV + battery"]
 
         with patch.object(SemsApi, "stopEvCharging", return_value=True) as stop:
             await hass.services.async_call(
@@ -248,7 +291,7 @@ async def test_ev_charger_entities(
             await hass.services.async_call(
                 "select",
                 "select_option",
-                {"entity_id": mode.entity_id, "option": "fast"},
+                {"entity_id": mode.entity_id, "option": "Fast"},
                 blocking=True,
             )
         set_mode.assert_called_once_with(
@@ -317,3 +360,205 @@ async def test_ev_charger_entities(
             "buyPwrLimit",
             5.5,
         )
+
+
+@patch.object(SemsApi, "_get_web_energy_statistics", return_value=None)
+@patch.object(SemsApi, "getWebStationFlow", return_value={"pEvChar": "n/a"})
+def test_get_web_data_ignores_invalid_ev_charging_power(mock_flow, mock_statistics):
+    """Test an invalid station-flow EV power does not break charger data."""
+    with patch.object(SemsApi, "_make_api_call", side_effect=_fake_api_call):
+        result = _web_api().getWebData(STATION_ID)
+
+    assert "charging_power" not in result["ev_chargers"][CHARGER_SN]
+
+
+def test_get_web_ev_charger_survives_failing_endpoints():
+    """Test each unavailable charger endpoint is skipped independently."""
+
+    def fake_api_call(url_part, *args, **kwargs):
+        if "telemetry" in url_part or "ev-charger/detail" in url_part:
+            raise OutOfRetries("unavailable")
+        if "telecounting" in url_part:
+            return {"not": "a list"}
+        if "control-item-content-list" in url_part:
+            return MODE_INFO
+        if "getLastCharge" in url_part:
+            return {"chargeLog": None}
+        return None
+
+    with patch.object(SemsApi, "_make_api_call", side_effect=fake_api_call):
+        charger = _web_api().getWebEvCharger(STATION_ID, {"sn": CHARGER_SN})
+
+    assert charger["factors"] == {}
+    assert charger["mode_info"] == MODE_INFO
+    assert charger["charge_log"] == {}
+    assert charger["detail"] == {}
+
+
+def test_get_web_ev_charger_without_model_skips_detail():
+    """Test the detail request needs the charger model."""
+
+    def fake_api_call(url_part, *args, **kwargs):
+        if "control-item-content-list" in url_part:
+            raise OutOfRetries("unavailable")
+        if "getLastCharge" in url_part:
+            return []
+        assert "ev-charger/detail" not in url_part
+        return []
+
+    with patch.object(SemsApi, "_make_api_call", side_effect=fake_api_call):
+        charger = _web_api().getWebEvCharger(STATION_ID, {"sn": CHARGER_SN})
+
+    assert charger["mode_info"] == {}
+    assert charger["charge_log"] == {}
+    assert charger["detail"] == {}
+
+
+def test_web_factors_with_units_skips_invalid_entries():
+    """Test malformed groups and factors are ignored."""
+    assert SemsApi._web_factors_with_units(
+        [
+            "not a group",
+            {
+                "factors": [
+                    "not a factor",
+                    {"code": "missing_data"},
+                    {"code": "text", "data": "V1.2"},
+                    {"code": 5, "data": "1"},
+                    {"code": "power", "data": "1.5", "unit": "", "alias": ""},
+                ]
+            },
+        ]
+    ) == {"power": {"value": 1.5, "unit": None, "alias": "power"}}
+
+
+def _coordinator(charger: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        data=SimpleNamespace(ev_chargers={CHARGER_SN: charger}),
+        station_id=STATION_ID,
+        sems_api=Mock(),
+        async_request_refresh=AsyncMock(),
+    )
+
+
+def test_ev_charger_entities_handle_missing_and_invalid_values():
+    """Test entities report unknown instead of failing on bad SEMS+ data."""
+    coordinator = _coordinator(
+        {
+            "factors": {},
+            "mode_info": {"chargeMode": "?", "ratedPower": "?"},
+            "detail": {"chargeMode": None},
+            "charge_log": {"workStu": "?", "status": "?", "mileage": "?"},
+        }
+    )
+
+    assert EvChargerStatusSensor(coordinator, CHARGER_SN).native_value is None
+    assert EvChargerPlugSensor(coordinator, CHARGER_SN).native_value is None
+    assert (
+        EvChargerSessionSensor(coordinator, CHARGER_SN, "mileage").native_value is None
+    )
+    assert EvChargerChargingSwitch(coordinator, CHARGER_SN).is_on is None
+    assert EvChargeModeSelect(coordinator, CHARGER_SN).current_option is None
+    factor = EvChargerFactorSensor(coordinator, CHARGER_SN, "firmware", {"unit": "rpm"})
+    assert factor.native_value is None
+    assert factor.native_unit_of_measurement == "rpm"
+    assert EvChargerConfigSwitch(coordinator, CHARGER_SN, "dynamicLoad").is_on is None
+    number = EvChargerConfigNumber(coordinator, CHARGER_SN, "ratedMaxiChargePower")
+    assert number.native_value is None
+    # Unknown rated power falls back to a 22 kW charger.
+    assert (number.native_min_value, number.native_max_value) == (4.2, 22.0)
+
+
+def test_ev_charger_config_number_ranges():
+    """Test number ranges follow the charger's rated power and SEMS ranges."""
+    coordinator = _coordinator(
+        {
+            "mode_info": {
+                "ratedPower": 7,
+                "controlItemRanges": {"Buy_Pwr_Limit": {"min": "x"}},
+            }
+        }
+    )
+
+    output = EvChargerConfigNumber(coordinator, CHARGER_SN, "ratedMaxiChargePower")
+    assert (output.native_min_value, output.native_max_value) == (1.4, 7.0)
+    import_limit = EvChargerConfigNumber(coordinator, CHARGER_SN, "buyPwrLimit")
+    assert (import_limit.native_min_value, import_limit.native_max_value) == (
+        0.0,
+        22.0,
+    )
+    current = EvChargerConfigNumber(coordinator, CHARGER_SN, "currentLimit")
+    assert (current.native_min_value, current.native_max_value) == (0.0, 63.0)
+
+
+async def test_ev_charger_commands_report_errors(hass: HomeAssistant) -> None:
+    """Test unknown models and rejected commands raise service errors."""
+    coordinator = _coordinator({"mode_info": {}, "detail": {}})
+    switch = EvChargerChargingSwitch(coordinator, CHARGER_SN)
+    switch.hass = hass
+    switch.entity_id = "switch.wallbox_start_charging"
+
+    with pytest.raises(HomeAssistantError, match="charger model is unknown"):
+        await switch.async_turn_on()
+
+    coordinator.data.ev_chargers[CHARGER_SN]["mode_info"] = MODE_INFO
+    coordinator.sems_api.startEvCharging.return_value = False
+    with pytest.raises(HomeAssistantError, match="SEMS rejected"):
+        await switch.async_turn_on()
+    coordinator.sems_api.startEvCharging.assert_called_once_with(
+        STATION_ID, CHARGER_SN, "GW11K-HCA-20", 0
+    )
+    coordinator.async_request_refresh.assert_not_called()
+
+
+async def test_ev_charger_config_commands(hass: HomeAssistant) -> None:
+    """Test config switches turn off and whole-ampere numbers send integers."""
+    coordinator = _coordinator({"mode_info": MODE_INFO, "detail": {"currentLimit": 16}})
+    coordinator.sems_api.setEvChargerConfig.return_value = True
+    config_switch = EvChargerConfigSwitch(coordinator, CHARGER_SN, "phaseSwitch")
+    number = EvChargerConfigNumber(coordinator, CHARGER_SN, "currentLimit")
+    for entity in (config_switch, number):
+        entity.hass = hass
+        entity.entity_id = "test.entity"
+
+    await config_switch.async_turn_off()
+    await number.async_set_native_value(20.0)
+
+    assert [
+        call.args[3:] for call in coordinator.sems_api.setEvChargerConfig.call_args_list
+    ] == [
+        ("phaseSwitch", 0),
+        ("currentLimit", 20),
+    ]
+    assert coordinator.async_request_refresh.await_count == 2
+
+
+def test_ev_charger_sensors_without_optional_values():
+    """Test only always-present sensors are created for a bare charger."""
+    coordinator = _coordinator({"charge_log": {}})
+
+    sensors = ev_charger_sensors(coordinator)
+
+    assert [type(sensor) for sensor in sensors] == [
+        EvChargerStatusSensor,
+        EvChargerPlugSensor,
+    ]
+    assert sensors[1].native_value is None
+    factor = EvChargerFactorSensor(coordinator, CHARGER_SN, "count", {"unit": ""})
+    assert factor.native_unit_of_measurement is None
+
+
+def test_get_web_ev_charger_ignores_invalid_detail():
+    """Test a non-object detail response leaves the settings empty."""
+
+    def fake_api_call(url_part, *args, **kwargs):
+        if "control-item-content-list" in url_part:
+            return MODE_INFO
+        if "ev-charger/detail" in url_part:
+            return []
+        return None
+
+    with patch.object(SemsApi, "_make_api_call", side_effect=fake_api_call):
+        charger = _web_api().getWebEvCharger(STATION_ID, {"sn": CHARGER_SN})
+
+    assert charger["detail"] == {}
