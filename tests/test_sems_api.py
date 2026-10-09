@@ -2,8 +2,10 @@
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -1182,7 +1184,8 @@ class TestSemsApi:
         result = self.api.getBatteryImmediateChargingStates(MOCK_INVERTER_SN)
 
         assert mock_request.call_count == 1
-        assert result == {}
+        # No state, rather than an empty state that reads as "disabled".
+        assert result is None
         assert (
             mock_request.call_args_list[0]
             .args[1]
@@ -1453,6 +1456,99 @@ class TestSemsApi:
         assert result["load"] == 500
         assert result["grid"] == 2530
         assert result["gridStatus"] == -1
+
+    def test_normalize_web_homekit_data_skips_null_and_invalid_values(self):
+        """Test null or non-numeric flow values are skipped, not raised."""
+        result = SemsApi._normalize_web_homekit_data(
+            {"pAc": "n/a", "pGrid": None, "pConsum": 1.2, "pBat": "-"}
+        )
+
+        assert result["gridStatus"] == 1
+        assert result["loadStatus"] == 1
+        assert result["load"] == 1200
+        assert "pv" not in result
+        assert "grid" not in result
+        assert "battery" not in result
+
+    def test_prune_web_cache_drops_stale_entries(self):
+        """Stale date-keyed entries are evicted; counters and fresh ones stay."""
+        day = 86_400
+        self.api._web_cache = {
+            "station:day:2026-01-01:2026-01-01": (0.0, {"sum": [1.0]}),
+            "failed:production:station:2026-01-01:2026-01-01": (0.0, None),
+            "counters:station:SN1:INVERTER": (0.0, {"etotal": 10.0}),
+            "station:day:2026-01-03:2026-01-03": (2 * day, {"sum": [2.0]}),
+        }
+        self.api._web_cache_pruned_at = 0.0
+
+        with patch(
+            "custom_components.sems.sems_api.time.monotonic",
+            return_value=2 * day + 1,
+        ):
+            self.api._prune_web_cache()
+
+        assert set(self.api._web_cache) == {
+            "counters:station:SN1:INVERTER",
+            "station:day:2026-01-03:2026-01-03",
+        }
+
+    def test_prune_web_cache_runs_at_most_hourly(self):
+        """Pruning is skipped until the prune interval has passed."""
+        self.api._web_cache = {"old": (0.0, None)}
+        self.api._web_cache_pruned_at = 10 * 86_400
+
+        with patch(
+            "custom_components.sems.sems_api.time.monotonic",
+            return_value=10 * 86_400 + 60,
+        ):
+            self.api._prune_web_cache()
+
+        assert "old" in self.api._web_cache
+
+    def test_prune_web_cache_synchronizes_concurrent_writes(self):
+        """A cache writer cannot mutate the dict while pruning iterates it."""
+        iteration_started = Event()
+        continue_iteration = Event()
+
+        class PausingDict(dict):
+            def items(self):
+                entries = iter(super().items())
+                yield next(entries)
+                iteration_started.set()
+                assert continue_iteration.wait(timeout=5)
+                yield from entries
+
+        self.api._web_cache = PausingDict({"old-1": (0.0, None), "old-2": (0.0, None)})
+        self.api._web_cache_pruned_at = 0.0
+
+        with (
+            patch(
+                "custom_components.sems.sems_api.time.monotonic",
+                return_value=3 * 86_400,
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            prune = executor.submit(self.api._prune_web_cache)
+            assert iteration_started.wait(timeout=5)
+            write = executor.submit(
+                self.api._set_web_cache_entry, "fresh", (3 * 86_400, None)
+            )
+            assert not write.done()
+            continue_iteration.set()
+            prune.result(timeout=5)
+            write.result(timeout=5)
+
+        assert self.api._web_cache == {"fresh": (3 * 86_400, None)}
+
+    def test_get_web_data_prunes_web_cache(self):
+        """Every data refresh gives the cache a chance to shrink."""
+        with (
+            patch.object(
+                SemsApi, "_prune_web_cache", side_effect=RuntimeError("pruned")
+            ),
+            pytest.raises(RuntimeError, match="pruned"),
+        ):
+            self.api.getWebData("station")
 
     def test_normalize_web_homekit_data_maps_station_flow_without_meter(self):
         """Test station flow remains usable when no smart meter is discovered."""
@@ -2463,6 +2559,55 @@ class TestSemsApi:
         assert "more_batterys" not in result["inverter"][1]["invert_full"]
         assert mock_telemetry.call_count == 2
         assert mock_telecounting.call_count == 2
+
+    @patch.object(SemsApi, "_get_web_energy_statistics", return_value=None)
+    @patch.object(SemsApi, "getWebStationFlow", return_value={})
+    @patch.object(SemsApi, "getWebInverterTelecounting", return_value={})
+    @patch.object(SemsApi, "getWebInverterTelemetry", return_value={"pac": 900.0})
+    @patch.object(SemsApi, "getWebInverterDevices")
+    def test_get_web_data_survives_denied_storage_lookup(
+        self,
+        mock_devices,
+        mock_telemetry,
+        mock_telecounting,
+        mock_flow,
+        mock_statistics,
+    ):
+        """A denied optional storage lookup must not fail the station refresh."""
+        mock_devices.return_value = [
+            {
+                "sn": "INV1",
+                "name": "Inverter",
+                "subtype": "store",
+                "deviceType": "INVERTER",
+            }
+        ]
+        with patch.object(
+            self.api,
+            "getEnergyStorageIntegratedCabinets",
+            side_effect=SemsPermissionError("relatedDevices", "denied"),
+        ):
+            result = self.api.getWebData("station")
+
+        inverter = result["inverter"][0]["invert_full"]
+        assert inverter["pac"] == 900.0
+        assert "battery_count" not in inverter
+
+    @patch.object(SemsApi, "getBatterySystemTelemetry")
+    def test_web_batteries_skip_denied_battery_telemetry(self, mock_telemetry):
+        """A denied BAT_SYS telemetry request only drops that battery."""
+        mock_telemetry.side_effect = [
+            SemsPermissionError("BAT_SYS telemetry", "denied"),
+            {"soc": 99.0, "power": 1.25},
+        ]
+        cabinets = [
+            {"sn": "BAT_A", "type": "BAT_SYS"},
+            {"sn": "BAT_B", "type": "BAT_SYS"},
+        ]
+
+        assert self.api._get_web_batteries("station", cabinets) == [
+            {"sn": "BAT_B", "soc": 99.0, "pbattery": 1250.0}
+        ]
 
 
 class TestOutOfRetries:

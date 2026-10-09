@@ -5,12 +5,22 @@ from __future__ import annotations
 from copy import deepcopy
 from unittest.mock import patch
 
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+import pytest
+from homeassistant.config_entries import SOURCE_REAUTH
+from homeassistant.const import (
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    STATE_UNAVAILABLE,
+    Platform,
+)
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity_platform import async_get_platforms
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.sems.const import CONF_STATION_ID, DOMAIN
+from custom_components.sems.sems_api import OutOfRetries, SemsAuthError
 from tests.fixtures import MOCK_GET_DATA_RESULT_MINIMAL
 
 POWER_STATION_ID = "12345678-1234-5678-9abc-123456789abc"
@@ -147,6 +157,74 @@ async def test_immediate_charging_entity_commands(hass: HomeAssistant) -> None:
         assert hass.states.get(entity_id).state == value
 
 
+async def _refresh_with_states(hass: HomeAssistant, entry: MockConfigEntry, **states):
+    """Refresh the coordinator with the given immediate-charging state patch."""
+    with (
+        patch(
+            "custom_components.sems.sems_api.SemsApi.getData",
+            return_value=MOCK_GET_DATA_RESULT_MINIMAL,
+        ),
+        patch(
+            "custom_components.sems.sems_api.SemsApi.getEnergyStorageIntegratedCabinets",
+            return_value=CABINETS,
+        ),
+        patch(
+            "custom_components.sems.sems_api.SemsApi.getBatteryGeneralFunctions",
+            return_value=FUNCTIONS,
+        ),
+        patch(
+            "custom_components.sems.sems_api.SemsApi.getBatteryImmediateChargingStates",
+            **states,
+        ),
+    ):
+        await entry.runtime_data.coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize(
+    "states",
+    [
+        {"return_value": None},
+        {"return_value": {"sn": INVERTER_SERIAL, "data": None}},
+        {"side_effect": OutOfRetries("state request failed")},
+    ],
+    ids=["no-result", "no-data", "out-of-retries"],
+)
+async def test_failed_state_read_marks_entities_unavailable(
+    hass: HomeAssistant, states: dict
+) -> None:
+    """A failed state read must not report immediate charging as off."""
+    entry = await _setup_entry(hass)
+    control_ids = [
+        _entity_id(hass, Platform.SWITCH, "battery_immediate_charging"),
+        _entity_id(hass, Platform.NUMBER, "end_charge_soc"),
+        _entity_id(hass, Platform.NUMBER, "bat_immediate_charge_power"),
+    ]
+
+    await _refresh_with_states(hass, entry, **states)
+
+    assert entry.runtime_data.coordinator.last_update_success
+    for entity_id in control_ids:
+        assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+    # Without a state the controls report no value, never "off" or 0.
+    entities = {
+        entity_id: entity
+        for platform in async_get_platforms(hass, DOMAIN)
+        for entity_id, entity in platform.entities.items()
+    }
+    assert entities[control_ids[0]].is_on is None
+    assert entities[control_ids[1]].native_value is None
+    inverter_switch = er.async_get(hass).async_get_entity_id(
+        Platform.SWITCH, DOMAIN, f"{INVERTER_SERIAL}-switch"
+    )
+    assert hass.states.get(inverter_switch).state == "on"
+
+    await _refresh_with_states(hass, entry, return_value=STATES)
+
+    assert hass.states.get(control_ids[0]).state == "on"
+    assert hass.states.get(control_ids[1]).state == "75.0"
+
+
 async def test_entities_require_supported_functions(hass: HomeAssistant) -> None:
     """Do not add controls when the API does not advertise their functions."""
     await _setup_entry(hass, functions={})
@@ -232,3 +310,62 @@ async def test_inverter_switch_status_five_is_on(hass: HomeAssistant) -> None:
     )
     assert entity_id is not None
     assert hass.states.get(entity_id).state == "on"
+
+
+def _reauth_flows(hass: HomeAssistant, entry: MockConfigEntry) -> list:
+    return hass.config_entries.flow.async_progress_by_handler(
+        DOMAIN, match_context={"entry_id": entry.entry_id, "source": SOURCE_REAUTH}
+    )
+
+
+async def test_inverter_switch_rejected_credentials_start_reauth(
+    hass: HomeAssistant,
+) -> None:
+    """A control command rejected for bad credentials asks for reauth."""
+    entry = await _setup_entry(
+        hass,
+        cabinets=[],
+        functions={},
+        get_data={**MOCK_GET_DATA_RESULT_MINIMAL, "info": {"is_stored": False}},
+    )
+    entity_id = er.async_get(hass).async_get_entity_id(
+        Platform.SWITCH, DOMAIN, f"{INVERTER_SERIAL}-switch"
+    )
+
+    with (
+        patch(
+            "custom_components.sems.sems_api.SemsApi.change_status",
+            side_effect=SemsAuthError("rejected"),
+        ),
+        pytest.raises(HomeAssistantError, match="reauthenticate"),
+    ):
+        await hass.services.async_call(
+            "switch", "turn_off", {"entity_id": entity_id}, blocking=True
+        )
+    await hass.async_block_till_done()
+
+    assert len(_reauth_flows(hass, entry)) == 1
+
+
+async def test_battery_number_rejected_credentials_start_reauth(
+    hass: HomeAssistant,
+) -> None:
+    """Battery settings rejected for bad credentials ask for reauth."""
+    with patch(
+        "custom_components.sems.sems_api.SemsApi.setImmediateChargingEndSoC",
+        side_effect=SemsAuthError("rejected"),
+    ):
+        entry = await _setup_entry(hass)
+        with pytest.raises(HomeAssistantError, match="reauthenticate"):
+            await hass.services.async_call(
+                "number",
+                "set_value",
+                {
+                    "entity_id": _entity_id(hass, Platform.NUMBER, "end_charge_soc"),
+                    "value": 80,
+                },
+                blocking=True,
+            )
+        await hass.async_block_till_done()
+
+    assert len(_reauth_flows(hass, entry)) == 1
